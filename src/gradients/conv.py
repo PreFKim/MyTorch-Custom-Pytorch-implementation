@@ -1,5 +1,106 @@
 from src.gradients.grad import Function, unbroadcast
 import numpy as np
+from numba import njit, prange
+
+@njit(parallel=True)
+def _conv1d_forward_kernel(data, weight, out, stride, kernel_size):
+    batch_size, in_channels, in_length = data.shape
+    out_channels = weight.shape[0]
+    out_length = out.shape[2]
+    stride_val = stride[0]
+    
+    for i in prange(batch_size):
+        for j in range(out_channels):
+            for k in range(out_length):
+                l_start = k * stride_val
+                val = 0.0
+                for m in range(in_channels):
+                    for n in range(kernel_size):
+                        val += data[i, m, l_start + n] * weight[j, m, n]
+                out[i, j, k] = val
+
+@njit(parallel=True)
+def _conv1d_backward_kernel(data, weight, grad, stride, kernel_size):
+    batch_size, in_channels, in_length = data.shape
+    out_channels = weight.shape[0]
+    out_length = grad.shape[2]
+    stride_val = stride[0]
+    
+    grad_node = np.zeros((batch_size, in_channels, in_length), dtype=data.dtype)
+    grad_weight = np.zeros((batch_size, out_channels, in_channels, kernel_size), dtype=data.dtype)
+    
+    for i in prange(batch_size):
+        for j in range(out_channels):
+            for k in range(out_length):
+                l_start = k * stride_val
+                g = grad[i, j, k]
+                for m in range(in_channels):
+                    for n in range(kernel_size):
+                        grad_node[i, m, l_start + n] += g * weight[j, m, n]
+        
+        for j in range(out_channels):
+            for m in range(in_channels):
+                for n in range(kernel_size):
+                    val = 0.0
+                    for k in range(out_length):
+                        val += grad[i, j, k] * data[i, m, k * stride_val + n]
+                    grad_weight[i, j, m, n] = val
+                    
+    return grad_node, grad_weight
+
+@njit(parallel=True)
+def _conv2d_forward_kernel(data, weight, out, stride, kernel_height, kernel_width):
+    batch_size, in_channels, in_height, in_width = data.shape
+    out_channels = weight.shape[0]
+    out_height, out_width = out.shape[2:]
+    stride_h, stride_w = stride[0], stride[1]
+    
+    for i in prange(batch_size):
+        for j in range(out_channels):
+            for k in range(out_height):
+                h_start = k * stride_h
+                for l in range(out_width):
+                    w_start = l * stride_w
+                    val = 0.0
+                    for m in range(in_channels):
+                        for n in range(kernel_height):
+                            for p in range(kernel_width):
+                                val += data[i, m, h_start + n, w_start + p] * weight[j, m, n, p]
+                    out[i, j, k, l] = val
+
+@njit(parallel=True)
+def _conv2d_backward_kernel(data, weight, grad, stride, kernel_height, kernel_width):
+    batch_size, in_channels, in_height, in_width = data.shape
+    out_channels = weight.shape[0]
+    out_height, out_width = grad.shape[2:]
+    stride_h, stride_w = stride[0], stride[1]
+    
+    grad_node = np.zeros((batch_size, in_channels, in_height, in_width), dtype=data.dtype)
+    grad_weight = np.zeros((batch_size, out_channels, in_channels, kernel_height, kernel_width), dtype=data.dtype)
+    
+    for i in prange(batch_size):
+        for j in range(out_channels):
+            for k in range(out_height):
+                h_start = k * stride_h
+                for l in range(out_width):
+                    w_start = l * stride_w
+                    g = grad[i, j, k, l]
+                    for m in range(in_channels):
+                        for n in range(kernel_height):
+                            for p in range(kernel_width):
+                                grad_node[i, m, h_start + n, w_start + p] += g * weight[j, m, n, p]
+        
+        for j in range(out_channels):
+            for m in range(in_channels):
+                for n in range(kernel_height):
+                    for p in range(kernel_width):
+                        val = 0.0
+                        for k in range(out_height):
+                            for l in range(out_width):
+                                val += grad[i, j, k, l] * data[i, m, k * stride_h + n, l * stride_w + p]
+                        grad_weight[i, j, m, n, p] = val
+                        
+    return grad_node, grad_weight
 
 class Convolution(Function):
     @staticmethod
@@ -62,82 +163,67 @@ class Convolution(Function):
         return grad_node, grad_weight, grad_bias if bias is not None else None
 
 def Conv1d_forward(data, weight, out_shape, stride):
-    out_channels, in_channels, *kernel_size = weight.shape
-    l, = data.shape[-1:]
-
-    left = (kernel_size[0]-1)//2
-    right = kernel_size[0]//2
-
-    ret = np.zeros(out_shape, dtype=data.dtype)
-    for c in range(out_channels): 
-        for i in range(left, l-right, stride[0]):
-            ret[..., c, (i-left)//stride[0]] = (data[..., i-left:i+right+1] * weight[c]).sum((-1, -2)) # batch, in_channels, kernel_size -> batch, 1, 1
-    return ret
+    if data.ndim == 2:
+        data_3d = data[np.newaxis, ...]
+        out_3d = np.zeros((1, *out_shape), dtype=data.dtype)
+    else:
+        data_3d = data
+        out_3d = np.zeros(out_shape, dtype=data.dtype)
+    
+    kernel_size = weight.shape[2]
+    _conv1d_forward_kernel(data_3d, weight, out_3d, np.array(stride), kernel_size)
+    
+    if data.ndim == 2:
+        return out_3d[0]
+    return out_3d
 
 def Conv1d_backward(data, weight, grad, stride, padding, batch_first):
-    kernel_size = weight.shape[2:]
-    l, = data.shape[-1:]
-    grad_l, = grad.shape[-1:]
-
-    left = (kernel_size[0]-1)//2
-    right = kernel_size[0]//2
-
-    grad_node = np.zeros_like(data)
-    grad_weight = np.zeros((data.shape[0], *weight.shape), dtype=data.dtype) if batch_first else np.zeros_like(weight)
-
-    for i in range(grad_l):
-        grad_node[..., (i*stride[0]): (i*stride[0])+left+right+1] += (weight * grad[..., np.newaxis, i:i+1]).sum(-3)
-        # grad_node -> (batch), in_channels, out_length+2*padding
-        # weight -> out_channels, in_channels, kernel_size 
-        # grad -> (batch), out_chennels, out_length -> indexing -> (batch), out_channels, 1, 1
-        # weight * grad -> (batch), out_channels, in_channels, kernel_size -> (batch), in_channels, kernel_size
+    if not batch_first:
+        data_3d = data[np.newaxis, ...]
+        grad_3d = grad[np.newaxis, ...]
+    else:
+        data_3d = data
+        grad_3d = grad
+        
+    kernel_size = weight.shape[2]
+    grad_node_3d, grad_weight_4d = _conv1d_backward_kernel(data_3d, weight, grad_3d, np.array(stride), kernel_size)
     
-    grad_node = grad_node[..., padding[0]:l-padding[0]]
-
-    for i in range(grad_l):
-        grad_weight += data[..., np.newaxis, :, (i*stride[0]):(i*stride[0])+left+right+1] * grad[..., np.newaxis, i:i+1]
-        # node -> (batch), in_channels, in_length -> indexing -> (batch), 1, in_channels, kernel_size
-        # grad -> (batch), out_chennels, out_length -> indexing -> (batch), out_chennels, 1, 1
-        # node * grad -> (batch), out_channels, in_channels, kernel_size -> (batch), out_channels, kernel_size
-    return grad_node, grad_weight
+    in_length = data_3d.shape[2]
+    grad_node_3d = grad_node_3d[..., padding[0]:in_length-padding[0]]
+    
+    if not batch_first:
+        return grad_node_3d[0], grad_weight_4d[0]
+    return grad_node_3d, grad_weight_4d
 
 def Conv2d_forward(data, weight, out_shape, stride):
-    out_channels, in_channels, *kernel_size = weight.shape
-    h, w = data.shape[-2:]
-
-    top = (kernel_size[0]-1)//2
-    bottom = kernel_size[0]//2 
-    left = (kernel_size[1]-1)//2
-    right = kernel_size[1]//2
-
-    ret = np.zeros(out_shape, dtype=data.dtype)
-    for c in range(out_channels): 
-        for i in range(top, h-bottom, stride[0]):
-            for j in range(left, w-right, stride[1]):
-                ret[..., c, (i-top)//stride[0], (j-left)//stride[1]] = (data[..., i-top:i+bottom+1, j-left:j+right+1] * weight[c]).sum((-1, -2, -3)) 
-    return ret
+    if data.ndim == 3:
+        data_4d = data[np.newaxis, ...]
+        out_4d = np.zeros((1, *out_shape), dtype=data.dtype)
+    else:
+        data_4d = data
+        out_4d = np.zeros(out_shape, dtype=data.dtype)
+    
+    kernel_height, kernel_width = weight.shape[2:]
+    _conv2d_forward_kernel(data_4d, weight, out_4d, np.array(stride), kernel_height, kernel_width)
+    
+    if data.ndim == 3:
+        return out_4d[0]
+    return out_4d
 
 def Conv2d_backward(data, weight, grad, stride, padding, batch_first):
-    kernel_size = weight.shape[2:]
-    h, w = data.shape[-2:]
-    grad_h, grad_w = grad.shape[-2:]
-
-    top = (kernel_size[0]-1)//2
-    bottom = kernel_size[0]//2 
-    left = (kernel_size[1]-1)//2
-    right = kernel_size[1]//2
-
-    grad_node = np.zeros_like(data)
-    grad_weight = np.zeros((data.shape[0], *weight.shape), dtype=data.dtype) if batch_first else np.zeros_like(weight)
-    
-    for i in range(grad_h):
-        for j in range(grad_w):
-            grad_node[..., (i*stride[0]): (i*stride[0])+top+bottom+1, (j*stride[1]): (j*stride[1])+left+right+1] += (weight * grad[..., np.newaxis, i:i+1, j:j+1]).sum(-4)
-    
-    grad_node = grad_node[..., padding[0]:h-padding[0], padding[1]:w-padding[1]]
-
-    for i in range(grad_h):
-        for j in range(grad_w):
-            grad_weight += data[..., np.newaxis, :, (i*stride[0]):(i*stride[0])+top+bottom+1, (j*stride[1]):(j*stride[1])+left+right+1] * grad[..., np.newaxis, i:i+1, j:j+1]
+    if not batch_first:
+        data_4d = data[np.newaxis, ...]
+        grad_4d = grad[np.newaxis, ...]
+    else:
+        data_4d = data
+        grad_4d = grad
         
-    return grad_node, grad_weight
+    kernel_height, kernel_width = weight.shape[2:]
+    grad_node_4d, grad_weight_5d = _conv2d_backward_kernel(data_4d, weight, grad_4d, np.array(stride), kernel_height, kernel_width)
+    
+    in_height, in_width = data_4d.shape[-2:]
+    grad_node_4d = grad_node_4d[..., padding[0]:in_height-padding[0], padding[1]:in_width-padding[1]]
+    
+    if not batch_first:
+        return grad_node_4d[0], grad_weight_5d[0]
+    return grad_node_4d, grad_weight_5d

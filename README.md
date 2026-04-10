@@ -18,7 +18,7 @@
 - [x] Implements the Non-Linear functions
 - [x] Fix inplace operation (Set Method)
 - [x] Train/inference with real dataset([Boston](http://lib.stat.cmu.edu/datasets/boston), [MNIST](https://yann.lecun.com/exdb/mnist/), etc.)
-- [ ] Optimize the speed of convolution operation
+- [x] Optimize the speed of convolution operation
 - [ ] Implements custom array object
 
 ## Result
@@ -37,7 +37,7 @@
 
     ```bash
     git clone https://github.com/PreFKim/MyTorch.git
-    pip install numpy matplotlib pytorch
+    pip install numpy numba matplotlib pytorch
     cd MyTorch
     ```
 
